@@ -1,0 +1,117 @@
+# Builds the signed Android App Bundle (.aab) for Google Play.
+#
+# One-time setup - GitHub repo -> Settings -> Secrets and variables -> Actions -> New repository secret:
+#   UPLOAD_KEYSTORE_BASE64    the upload keystore (.jks), base64-encoded
+#   UPLOAD_KEYSTORE_PASSWORD  its password (also used as the key password)
+# Optional: UPLOAD_KEY_ALIAS (default "upload") and UPLOAD_KEY_PASSWORD (default: the keystore password).
+#
+# Run it: Actions -> "Release AAB (Google Play)" -> Run workflow, or push a tag such as v1.0.0.
+# Download the bundle from the run's Artifacts section and upload the .aab in Play Console.
+name: Release AAB (Google Play)
+
+on:
+  workflow_dispatch:
+  push:
+    tags: [ 'v*' ]
+
+permissions:
+  contents: read
+
+jobs:
+  release-aab:
+    name: Build signed release bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v5
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle (with build cache)
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Make the Gradle wrapper executable
+        run: chmod +x ./gradlew
+
+      - name: Restore the upload key from secrets
+        id: key
+        env:
+          KEYSTORE_B64: ${{ secrets.UPLOAD_KEYSTORE_BASE64 }}
+          STORE_PASS: ${{ secrets.UPLOAD_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.UPLOAD_KEY_ALIAS || 'upload' }}
+        run: |
+          if [ -z "$KEYSTORE_B64" ] || [ -z "$STORE_PASS" ]; then
+            echo "::error::Add the UPLOAD_KEYSTORE_BASE64 and UPLOAD_KEYSTORE_PASSWORD secrets (Settings > Secrets and variables > Actions), then run this workflow again."
+            exit 1
+          fi
+          printf '%s' "$KEYSTORE_B64" | base64 --decode --ignore-garbage > "$RUNNER_TEMP/upload.jks"
+          if ! keytool -list -keystore "$RUNNER_TEMP/upload.jks" -storepass "$STORE_PASS" -alias "$KEY_ALIAS" > /dev/null 2>&1; then
+            echo "::error::The keystore secret could not be opened with that password, or it has no key named '$KEY_ALIAS'."
+            exit 1
+          fi
+          FP=$(keytool -list -v -keystore "$RUNNER_TEMP/upload.jks" -storepass "$STORE_PASS" -alias "$KEY_ALIAS" | grep -m1 'SHA256:' | awk '{print $2}')
+          echo "fingerprint=$FP" >> "$GITHUB_OUTPUT"
+          echo "Upload key restored (alias $KEY_ALIAS, SHA-256 $FP)"
+
+      - name: Build the signed release bundle
+        env:
+          FACTONIC_KEYSTORE: ${{ runner.temp }}/upload.jks
+          FACTONIC_KEYSTORE_PASSWORD: ${{ secrets.UPLOAD_KEYSTORE_PASSWORD }}
+          FACTONIC_KEY_ALIAS: ${{ secrets.UPLOAD_KEY_ALIAS || 'upload' }}
+          FACTONIC_KEY_PASSWORD: ${{ secrets.UPLOAD_KEY_PASSWORD || secrets.UPLOAD_KEYSTORE_PASSWORD }}
+        run: ./gradlew --no-daemon --stacktrace bundleRelease
+
+      - name: Check the signature and version
+        id: check
+        env:
+          EXPECTED_FP: ${{ steps.key.outputs.fingerprint }}
+        run: |
+          AAB=app/build/outputs/bundle/release/app-release.aab
+          test -f "$AAB" || { echo "::error::No bundle at $AAB"; exit 1; }
+          jarsigner -verify "$AAB" > /dev/null || { echo "::error::The bundle's signature does not verify"; exit 1; }
+          FP=$(keytool -printcert -jarfile "$AAB" | grep -m1 'SHA256:' | awk '{print $2}')
+          if [ "$FP" != "$EXPECTED_FP" ]; then
+            echo "::error::The bundle is signed with $FP, not with the upload key ($EXPECTED_FP)"
+            exit 1
+          fi
+          VERSION_NAME=$(sed -nE 's/.*versionName *= *"([^"]+)".*/\1/p' app/build.gradle.kts | head -n1)
+          VERSION_CODE=$(sed -nE 's/.*versionCode *= *([0-9]+).*/\1/p' app/build.gradle.kts | head -n1)
+          MANIFEST=$(find app/build/intermediates -name AndroidManifest.xml -path '*elease*' | xargs grep -l 'versionCode' 2>/dev/null | head -n1 || true)
+          TARGET_SDK=$( [ -n "$MANIFEST" ] && sed -nE 's/.*android:targetSdkVersion="([0-9]+)".*/\1/p' "$MANIFEST" | head -n1 || true)
+          BUILT_CODE=$( [ -n "$MANIFEST" ] && sed -nE 's/.*android:versionCode="([0-9]+)".*/\1/p' "$MANIFEST" | head -n1 || true)
+          NAME="Factonic-${VERSION_NAME}-vc${VERSION_CODE}"
+          mkdir -p dist
+          cp "$AAB" "dist/${NAME}.aab"
+          if [ -f app/build/outputs/mapping/release/mapping.txt ]; then cp app/build/outputs/mapping/release/mapping.txt "dist/${NAME}-mapping.txt"; fi
+          echo "name=${NAME}" >> "$GITHUB_OUTPUT"
+          {
+            echo "### Factonic ${VERSION_NAME} - signed release bundle"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| File | \`${NAME}.aab\` |"
+            echo "| versionCode | ${BUILT_CODE:-$VERSION_CODE} |"
+            echo "| targetSdk | ${TARGET_SDK:-see app/build.gradle.kts} |"
+            echo "| Upload key SHA-256 | \`${FP}\` |"
+            echo ""
+            echo "Download the artifact below, unzip it and upload the .aab in Play Console."
+            echo "\`${NAME}-mapping.txt\` is the R8 deobfuscation file for crash reports (Play Console -> App bundle explorer -> Downloads)."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the bundle
+        uses: actions/upload-artifact@v5
+        with:
+          name: ${{ steps.check.outputs.name }}-aab
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 90
+
+      - name: Remove the key from the runner
+        if: always()
+        run: rm -f "$RUNNER_TEMP/upload.jks"
