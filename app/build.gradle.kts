@@ -12,7 +12,7 @@ android {
     compileSdk = 36
 
     defaultConfig {
-        applicationId = "com.factonic.game"
+        applicationId = "com.factonic.app"
         minSdk = 26
         targetSdk = 36
         // Play Console: the last upload was versionCode 4. Raise this for every new upload.
