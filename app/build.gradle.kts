@@ -1,3 +1,5 @@
+import java.io.File
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
@@ -17,12 +19,40 @@ android {
 
     signingConfigs {
         create("release") {
-            val keystorePath = System.getenv("KEYSTORE_PATH")
-            if (!keystorePath.isNullOrBlank()) {
-                storeFile = file(keystorePath)
-                storePassword = System.getenv("KEYSTORE_PASSWORD")
-                keyAlias = System.getenv("KEY_ALIAS")
-                keyPassword = System.getenv("KEY_PASSWORD")
+            // Find password across all common variable names
+            val password = System.getenv("STORE_PASS")
+                ?: System.getenv("KEYSTORE_PASSWORD")
+                ?: System.getenv("KEY_PASSWORD")
+
+            // Key alias is "upload" as shown in the workflow log
+            val alias = System.getenv("KEY_ALIAS")
+                ?: System.getenv("KEYSTORE_ALIAS")
+                ?: "upload"
+
+            // Look for keystore in env var or common restored file locations
+            val candidatePaths = listOfNotNull(
+                System.getenv("KEYSTORE_PATH"),
+                System.getenv("KEYSTORE_FILE"),
+                "upload.keystore",
+                "app/upload.keystore",
+                "release.keystore",
+                "app/release.keystore",
+                "${System.getProperty("java.io.tmpdir")}/release.keystore",
+                "${System.getProperty("java.io.tmpdir")}/upload.keystore"
+            )
+
+            val resolvedFile = candidatePaths
+                .map { File(it) }
+                .firstOrNull { it.exists() && it.isFile }
+
+            println(">>> [Signing] Resolved Keystore: ${resolvedFile?.absolutePath}")
+            println(">>> [Signing] Key Alias: $alias | Password Set: ${!password.isNullOrBlank()}")
+
+            if (resolvedFile != null && !password.isNullOrBlank()) {
+                storeFile = resolvedFile
+                storePassword = password
+                keyAlias = alias
+                keyPassword = password
             }
         }
     }
@@ -30,7 +60,10 @@ android {
     buildTypes {
         release {
             isMinifyEnabled = false
-            signingConfig = signingConfigs.getByName("release")
+            val releaseConfig = signingConfigs.getByName("release")
+            if (releaseConfig.storeFile != null) {
+                signingConfig = releaseConfig
+            }
         }
     }
 
